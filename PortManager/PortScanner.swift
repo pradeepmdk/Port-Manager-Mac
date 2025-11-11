@@ -24,24 +24,39 @@ class PortScanner: ObservableObject {
     private func executeCommand() -> [PortInfo] {
         var portList: [PortInfo] = []
 
-        // Use lsof to get all listening ports
+        // Use lsof to get all listening TCP ports
         let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
-        task.arguments = ["-iTCP", "-sTCP:LISTEN", "-n", "-P"]
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-iTCP", "-sTCP:LISTEN", "-n", "-P", "-F", "pcn"]
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        task.standardOutput = outputPipe
+        task.standardError = errorPipe
 
         do {
             try task.run()
             task.waitUntilExit()
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                portList = parseOutput(output)
+            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+            if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.isEmpty {
+                print("TCP lsof stderr: \(errorOutput)")
+            }
+
+            if let output = String(data: outputData, encoding: .utf8) {
+                print("TCP lsof output length: \(output.count)")
+                print("First 500 chars: \(String(output.prefix(500)))")
+                portList = parseFieldOutput(output, protocolType: "TCP")
+                print("Parsed \(portList.count) TCP ports")
+            }
+
+            if task.terminationStatus != 0 {
+                print("TCP lsof exited with status: \(task.terminationStatus)")
             }
         } catch {
+            print("Error running TCP lsof: \(error)")
             DispatchQueue.main.async {
                 self.errorMessage = "Error scanning ports: \(error.localizedDescription)"
             }
@@ -49,71 +64,111 @@ class PortScanner: ObservableObject {
 
         // Also get UDP ports
         let udpTask = Process()
-        udpTask.launchPath = "/usr/sbin/lsof"
-        udpTask.arguments = ["-iUDP", "-n", "-P"]
+        udpTask.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        udpTask.arguments = ["-iUDP", "-n", "-P", "-F", "pcn"]
 
-        let udpPipe = Pipe()
-        udpTask.standardOutput = udpPipe
-        udpTask.standardError = Pipe()
+        let udpOutputPipe = Pipe()
+        let udpErrorPipe = Pipe()
+        udpTask.standardOutput = udpOutputPipe
+        udpTask.standardError = udpErrorPipe
 
         do {
             try udpTask.run()
             udpTask.waitUntilExit()
 
-            let data = udpPipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                portList.append(contentsOf: parseOutput(output, isUDP: true))
+            let outputData = udpOutputPipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: outputData, encoding: .utf8) {
+                print("UDP lsof output length: \(output.count)")
+                portList.append(contentsOf: parseFieldOutput(output, protocolType: "UDP"))
+                print("Total ports after UDP: \(portList.count)")
             }
         } catch {
+            print("Error running UDP lsof: \(error)")
             // UDP scan is optional, don't show error
         }
 
-        return portList.sorted { $0.port < $1.port }
+        let sorted = portList.sorted { $0.port < $1.port }
+        print("Returning \(sorted.count) total ports")
+        return sorted
     }
 
-    private func parseOutput(_ output: String, isUDP: Bool = false) -> [PortInfo] {
+    private func parseFieldOutput(_ output: String, protocolType: String) -> [PortInfo] {
         var ports: [PortInfo] = []
         let lines = output.components(separatedBy: .newlines)
 
-        for line in lines.dropFirst() {
+        print("Parsing \(lines.count) lines for \(protocolType)")
+
+        var currentPid: Int?
+        var currentCommand: String?
+
+        for line in lines {
             guard !line.isEmpty else { continue }
 
-            let components = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard components.count >= 9 else { continue }
+            let prefix = line.prefix(1)
+            let value = String(line.dropFirst())
 
-            let processName = String(components[0])
-            guard let pid = Int(components[1]) else { continue }
+            switch prefix {
+            case "p":
+                // Process ID
+                currentPid = Int(value)
+                print("Found PID: \(value)")
+            case "c":
+                // Command name
+                currentCommand = value
+                print("Found command: \(value)")
+            case "n":
+                // Network address (address:port)
+                print("Found network: \(value), pid=\(String(describing: currentPid)), cmd=\(String(describing: currentCommand))")
+                guard let pid = currentPid,
+                      let command = currentCommand else {
+                    print("  Skipping - missing pid or command")
+                    continue
+                }
 
-            let addressInfo = String(components[8])
-            let parts = addressInfo.components(separatedBy: ":")
+                // Parse the network address
+                var addressString = value
+                var portString = ""
 
-            guard let portString = parts.last,
-                  let port = Int(portString.replacingOccurrences(of: "*", with: "")) else {
-                continue
+                // Handle different formats: *:PORT, IP:PORT, [IPv6]:PORT
+                if let lastColon = addressString.range(of: ":", options: .backwards) {
+                    portString = String(addressString[lastColon.upperBound...])
+                    addressString = String(addressString[..<lastColon.lowerBound])
+                }
+
+                // Extract port number
+                guard let port = Int(portString) else {
+                    print("  Failed to parse port from: \(portString)")
+                    continue
+                }
+
+                print("  Successfully parsed port: \(port)")
+
+                let state = protocolType == "TCP" ? "LISTEN" : "UDP"
+                let address = addressString.isEmpty || addressString == "*" ? "*" : addressString
+
+                let portInfo = PortInfo(
+                    port: port,
+                    protocolType: protocolType,
+                    state: state,
+                    processName: command,
+                    pid: pid,
+                    address: address
+                )
+
+                ports.append(portInfo)
+            default:
+                break
             }
-
-            let address = parts.dropLast().joined(separator: ":")
-            let state = isUDP ? "UDP" : (components.count >= 10 ? String(components[9]) : "LISTEN")
-            let protocolType = isUDP ? "UDP" : "TCP"
-
-            let portInfo = PortInfo(
-                port: port,
-                protocolType: protocolType,
-                state: state,
-                processName: processName,
-                pid: pid,
-                address: address.isEmpty ? "*" : address
-            )
-
-            ports.append(portInfo)
         }
+
+        print("Total ports parsed: \(ports.count)")
 
         return ports
     }
 
     func killProcess(pid: Int) {
         let task = Process()
-        task.launchPath = "/bin/kill"
+        task.executableURL = URL(fileURLWithPath: "/bin/kill")
         task.arguments = ["-9", "\(pid)"]
 
         do {
